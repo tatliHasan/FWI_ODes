@@ -1,0 +1,274 @@
+#The software is implemented in R and uses an iterative method to update the Canadian Forest Fire Weather Index (FWI) components based on daily meteorological inputs. The calculations follow the traditional FWI system but are extended through differential equation-based modeling for continuous updates. Key components include FFMC, DMC, and DC, with updates based on temperature, humidity, wind, and precipitation inputs. 
+#Usage:
+#1. Input: The meteorological data must be provided in a text file with headers specifying daily temperature, humidity, wind speed, and precipitation.
+#2. Running the simulation: Execute the script in R after adjusting the input file path and initial conditions.
+#3. Output: The results are saved as a CSV file with daily updates of fire weather indices.
+
+#Note: The model applies an iterative update method (Euler) rather than advanced solvers like Runge-Kutta.
+
+# Load necessary libraries
+library(dplyr)
+
+# Function to read meteorological data
+read_input_data <- function(file) {
+  data <- read.table(file, header = TRUE)
+  return(data)
+}
+
+# Function to calculate equilibrium moisture content (E_d)
+calculate_Ed <- function(H, T) {
+  Ed <- 0.942 * (H ^ 0.679) + 11 * exp((H - 100) / 10) + 0.18 * (21.1 - T) * (1 - exp(-0.115 * H))
+  return(Ed)
+}
+
+# Function to calculate drying rate K_d based on temperature and relative humidity
+calculate_Kd <- function(H, W, T) {
+  Kd <- 0.424 * (1 - (H / 100) ^ 1.7) + 0.0694 * sqrt(W) * (1 - (H / 100) ^ 8)
+  return(Kd)
+}
+
+# Function to update moisture content M
+update_M <- function(M_prev, P, H, T, W) {
+  if (P > 0.5) {
+    M <- M_prev + 42.5 * (P - 0.5) * exp(-100 / (251 - M_prev)) * (1 - exp(-6.93 / (P - 0.5)))
+  } else {
+    Ed <- calculate_Ed(H, T)
+    Kd <- calculate_Kd(H, W, T)
+    M <- Ed + (M_prev - Ed) / (10 ^ Kd)
+  }
+  return(M)
+}
+
+# Main simulation function
+simulate_fire_weather_indices <- function(data, total_days, initial_conditions) {
+  # Initialize previous moisture content
+  M_prev <- initial_conditions$FFMC  # Using FFMC as the initial value for M
+  
+  # Create a data frame to store results
+  results <- data.frame(Day = integer(0), FFMC = numeric(0), DMC = numeric(0), 
+                        DC = numeric(0), ISI = numeric(0), BUI = numeric(0), FWI = numeric(0))
+  
+  # Loop over each day
+  for (t in 1:total_days) {
+    # Extract weather data
+    T_t <- data$Temperature[t]
+    H_t <- data$Humidity[t]
+    W_t <- data$Wind[t]  # Ensure to use the correct column name here
+    P_t <- data$Precipitation[t]  # Assuming precipitation data is provided in the input file
+    
+    # Debug outputs for input values
+    cat("Debug - Day:", t, "T:", T_t, "H:", H_t, "W:", W_t, "P:", P_t, "\n")
+    
+    # Check if wind speed (W_t) is numeric
+    if (!is.numeric(W_t) || is.na(W_t)) {
+      stop(paste("Error: Wind speed is not numeric or NA on Day:", t))
+    }
+    
+    # Update moisture content M
+    M <- update_M(M_prev, P_t, H_t, T_t, W_t)
+    
+    # Update FFMC
+    FFMC <- (59.5 * (250 - M)) / (147.2 + M)
+    
+    # Update DMC
+    if (P_t > 1.5) {
+      B <- ifelse(initial_conditions$DMC <= 33, 
+                  100 / (0.5 + 0.3 * initial_conditions$DMC), 
+                  6.2 * log(initial_conditions$DMC) - 17.2)
+      DMC <- initial_conditions$DMC + (1000 * P_t) / (48.77 + B * P_t)
+    } else {
+      K_d <- 1.894 * (T_t + 1.1) * (100 - H_t) * (1 / 365)
+      DMC <- initial_conditions$DMC + K_d
+    }
+    
+    # Update DC
+    K_d <- 0.36 * (T_t + 2.8)
+    cat("Debug - Day:", t, "P_t:", P_t, "DC Before Calculation:", initial_conditions$DC, "\n")  # Debugging output for DC
+    if (P_t > 2.8) {
+      Q_o <- 800 * exp(-initial_conditions$DC / 400)
+      if (Q_o <= 0) {
+        DC <- initial_conditions$DC  # Fallback to initial value to avoid negative
+        cat("Warning - Q_o <= 0, using fallback value for DC on Day:", t, "\n")
+      } else {
+        DC <- initial_conditions$DC - 400 * log(1 + (3.937 * P_t) / Q_o)
+      }
+    } else {
+      DC <- initial_conditions$DC + K_d
+    }
+    
+    # Debug output for DC
+    cat("Debug - Day:", t, "DC:", DC, "\n")
+    
+    # Update ISI
+    f_w <- exp(0.05039 * W_t)
+    f_FFMC <- 91.9 * exp(-0.1386 * M) * (1 + (M^5.31) / (4.93 * 10^7))
+    ISI <- 0.208 * f_w * f_FFMC
+    
+    # Debug output for ISI
+    cat("Debug - Day:", t, "ISI:", ISI, "\n")
+    
+    # Update BUI
+    BUI <- ifelse(DMC + 0.4 * DC == 0, 0, (0.8 * (DMC * DC)) / (DMC + 0.4 * DC))  # Prevent division by zero
+    
+    # Debug output for BUI
+    cat("Debug - Day:", t, "BUI:", BUI, "\n")
+    
+    # Update FWI
+    FWI <- ifelse(BUI > 80, 
+                  0.1 * ISI * (1000 / (25 + 108.64 * exp(-0.023 * BUI))),
+                  0.1 * ISI * (0.626 * (BUI^0.809) + 2.0))
+    
+    # Debug output for FWI
+    cat("Debug - Day:", t, "FWI:", FWI, "\n")
+    
+    # Check for valid results before storing
+    if (!is.na(FFMC) && !is.na(DMC) && !is.na(DC) && !is.na(ISI) && !is.na(BUI) && !is.na(FWI)) {
+      # Store the results
+      results <- rbind(results, data.frame(Day = t, FFMC = FFMC, DMC = DMC, DC = DC, ISI = ISI, BUI = BUI, FWI = FWI))
+    } else {
+      warning(paste("Invalid values on day", t, "- skipping results for this day."))
+    }
+    
+    # Update previous moisture content for the next iteration
+    M_prev <- M
+    
+    # Update initial conditions for next day
+    initial_conditions$FFMC <- FFMC
+    initial_conditions$DMC <- DMC
+    initial_conditions$DC <- DC
+    initial_conditions$ISI <- ISI
+    initial_conditions$BUI <- BUI
+    initial_conditions$FWI <- FWI
+  }
+  
+  return(results)
+}
+
+# Main simulation function
+simulate_fire_weather_indices <- function(data, total_days, initial_conditions) {
+  # Initialize previous moisture content
+  M_prev <- initial_conditions$FFMC  # Using FFMC as the initial value for M
+  
+  # Create a data frame to store results
+  results <- data.frame(Day = integer(0), FFMC = numeric(0), DMC = numeric(0), 
+                        DC = numeric(0), ISI = numeric(0), BUI = numeric(0), FWI = numeric(0))
+  
+  # Loop over each day
+  for (t in 1:total_days) {
+    # Extract weather data using the correct column names
+    T_t <- data$Temperature[t]
+    H_t <- data$Humidity[t]
+    W_t <- data$Wind[t]
+    P_t <- data$Precipitation[t]  # Assuming precipitation data is provided in the input file
+    
+    # Debug outputs for input values
+    cat("Debug - Day:", t, "T:", T_t, "H:", H_t, "W:", W_t, "P:", P_t, "\n")
+    
+    # Check if wind speed (W_t) is numeric
+    if (!is.numeric(W_t) || is.na(W_t)) {
+      stop(paste("Error: Wind speed is not numeric or NA on Day:", t))
+    }
+    
+    # Update moisture content M
+    M <- update_M(M_prev, P_t, H_t, T_t, W_t)
+    
+    # Update FFMC
+    FFMC <- (59.5 * (250 - M)) / (147.2 + M)
+    
+    # Update DMC
+    if (P_t > 1.5) {
+      B <- ifelse(initial_conditions$DMC <= 33, 
+                  100 / (0.5 + 0.3 * initial_conditions$DMC), 
+                  6.2 * log(initial_conditions$DMC) - 17.2)
+      DMC <- initial_conditions$DMC + (1000 * P_t) / (48.77 + B * P_t)
+    } else {
+      K_d <- 1.894 * (T_t + 1.1) * (100 - H_t) * (1 / 365)
+      DMC <- initial_conditions$DMC + K_d
+    }
+    
+    # Update DC
+    K_d <- 0.36 * (T_t + 2.8)
+    cat("Debug - Day:", t, "P_t:", P_t, "DC Before Calculation:", initial_conditions$DC, "\n")  # Debugging output for DC
+    if (P_t > 2.8) {
+      Q_o <- 800 * exp(-initial_conditions$DC / 400)
+      if (Q_o <= 0) {
+        DC <- initial_conditions$DC  # Fallback to initial value to avoid negative
+        cat("Warning - Q_o <= 0, using fallback value for DC on Day:", t, "\n")
+      } else {
+        DC <- initial_conditions$DC - 400 * log(1 + (3.937 * P_t) / Q_o)
+      }
+    } else {
+      DC <- initial_conditions$DC + K_d
+    }
+    
+    # Debug output for DC
+    cat("Debug - Day:", t, "DC:", DC, "\n")
+    
+    # Update ISI
+    f_w <- exp(0.05039 * W_t)
+    f_FFMC <- 91.9 * exp(-0.1386 * M) * (1 + (M^5.31) / (4.93 * 10^7))
+    ISI <- 0.208 * f_w * f_FFMC
+    
+    # Debug output for ISI
+    cat("Debug - Day:", t, "ISI:", ISI, "\n")
+    
+    # Update BUI
+    BUI <- ifelse(DMC + 0.4 * DC == 0, 0, (0.8 * (DMC * DC)) / (DMC + 0.4 * DC))  # Prevent division by zero
+    
+    # Debug output for BUI
+    cat("Debug - Day:", t, "BUI:", BUI, "\n")
+    
+    # Update FWI
+    FWI <- ifelse(BUI > 80, 
+                  0.1 * ISI * (1000 / (25 + 108.64 * exp(-0.023 * BUI))),
+                  0.1 * ISI * (0.626 * (BUI^0.809) + 2.0))
+    
+    # Debug output for FWI
+    cat("Debug - Day:", t, "FWI:", FWI, "\n")
+    
+    # Check for valid results before storing
+    if (!is.na(FFMC) && !is.na(DMC) && !is.na(DC) && !is.na(ISI) && !is.na(BUI) && !is.na(FWI)) {
+      # Store the results
+      results <- rbind(results, data.frame(Day = t, FFMC = FFMC, DMC = DMC, DC = DC, ISI = ISI, BUI = BUI, FWI = FWI))
+    } else {
+      warning(paste("Invalid values on day", t, "- skipping results for this day."))
+    }
+    
+    # Update previous moisture content for the next iteration
+    M_prev <- M
+    
+    # Update initial conditions for next day
+    initial_conditions$FFMC <- FFMC
+    initial_conditions$DMC <- DMC
+    initial_conditions$DC <- DC
+    initial_conditions$ISI <- ISI
+    initial_conditions$BUI <- BUI
+    initial_conditions$FWI <- FWI
+  }
+  
+  return(results)
+}
+
+# Main execution
+# Load the input data
+input_data <- read_input_data("input_fire_index.txt")
+
+# Print the input data to check the structure and contents
+print(head(input_data))  # Print the first few rows of the data frame
+str(input_data)          # Print the structure of the data frame
+
+# Define the initial conditions
+initial_conditions <- list(FFMC = 87.65, DMC = 8.54, DC = 19, ISI = 10.78, BUI = 8.5, FWI = 10.04)
+
+# Define the total number of days to simulate
+total_days <- nrow(input_data)
+
+# Run the simulation
+fire_weather_results <- simulate_fire_weather_indices(input_data, total_days, initial_conditions)
+
+# Print the results
+print(fire_weather_results)
+
+# Optionally, save to a CSV file
+write.csv(fire_weather_results, "fire_weather_results.csv", row.names = FALSE)
+
