@@ -1,4 +1,4 @@
-# FWI_ODes
+# FWI_ODEs
 FWI index by ODEs
 FIRE WEATHER INDEX (FWI) DYNAMICS PROGRAM 
 Overview:
